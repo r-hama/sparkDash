@@ -1,0 +1,371 @@
+import dns from "node:dns/promises";
+import net from "node:net";
+
+/**
+ * Input validation for Spark targets (host / user / lanIp).
+ * Keeps SSRF-ish footguns smaller on an otherwise unauthenticated LAN dashboard.
+ */
+
+/** IPv4 dotted quad with each octet 0–255. */
+export function isValidIPv4(host) {
+  if (typeof host !== "string") return false;
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  return m.slice(1).every((o) => {
+    const n = Number(o);
+    return n >= 0 && n <= 255 && String(n) === String(Number(o));
+  });
+}
+
+/** DNS hostname (no spaces/shell metacharacters). */
+export function isValidHostname(host) {
+  if (typeof host !== "string" || host.length === 0 || host.length > 253) return false;
+  if (host === "localhost") return true;
+  return /^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$/.test(
+    host
+  );
+}
+
+/** Accept IPv4, IPv6, or hostname for SSH / LLM targets. */
+export function isValidHost(host) {
+  return typeof host === "string" && (net.isIP(host) !== 0 || isValidHostname(host));
+}
+
+function normalizedHost(host) {
+  const value = String(host || "").trim().toLowerCase();
+  return value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+}
+
+/** Dotted IPv4 for an IPv4-mapped IPv6 address, including the hex form. */
+function mappedIpv4(host) {
+  let body = host;
+  let dotted = null;
+  const v4 = body.match(/:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4 && net.isIP(v4[1]) === 4) {
+    dotted = v4[1];
+    body = body.slice(0, v4.index);
+  }
+  const halves = body.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const groups = head.length + tail.length + (dotted ? 2 : 0);
+  if (halves.length === 1 ? groups !== 8 : groups >= 8) return null;
+  const parts = [...head, ...(halves.length === 2 ? Array(8 - groups).fill("0") : []), ...tail];
+  if (dotted) {
+    const octets = dotted.split(".").map((octet) => Number(octet));
+    parts.push(((octets[0] << 8) | octets[1]).toString(16), ((octets[2] << 8) | octets[3]).toString(16));
+  }
+  if (parts.length !== 8 || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return null;
+  const nums = parts.map((part) => parseInt(part, 16));
+  if (nums.slice(0, 5).some((n) => n !== 0) || nums[5] !== 0xffff) return null;
+  return `${nums[6] >> 8}.${nums[6] & 255}.${nums[7] >> 8}.${nums[7] & 255}`;
+}
+
+/**
+ * The dotted quad a URL parser (and inet_aton, which ssh uses) reads a host as,
+ * or null when it is not a numeric IPv4 spelling. "2852039166", "0xa9fea9fe",
+ * "0251.0376.0251.0376" and "169.254.43518" are all 169.254.169.254.
+ */
+function canonicalIpv4(host) {
+  try {
+    const parsed = new URL(`http://${host}`).hostname;
+    return net.isIP(parsed) === 4 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isForbiddenAddress(address) {
+  const host = normalizedHost(address);
+  const family = net.isIP(host);
+  if (family === 4) {
+    const [a, b] = host.split(".").map(Number);
+    return a === 0 || (a === 169 && b === 254) || a >= 224;
+  }
+  if (family === 6) {
+    if (host === "::" || host.startsWith("ff")) return true;
+    const first = parseInt(host.split(":", 1)[0] || "0", 16);
+    if ((first & 0xffc0) === 0xfe80) return true;
+    const mapped = mappedIpv4(host);
+    if (mapped) return isForbiddenAddress(mapped);
+    return false;
+  }
+  // Not a literal address as written, but it may still be one to the resolver.
+  const canonical = canonicalIpv4(host);
+  return canonical !== null && isForbiddenAddress(canonical);
+}
+
+/** Resolve an administrator-allowlisted target and reject unsafe DNS answers. */
+export async function assertAllowedTarget(host, allowedHosts, { lookup = dns.lookup } = {}) {
+  const target = normalizedHost(host);
+  const allowed = new Set([...allowedHosts].map(normalizedHost));
+  if (!allowed.has(target)) {
+    const err = new Error(`Target ${target || "(empty)"} is not in the administrator allowlist`);
+    err.status = 403;
+    throw err;
+  }
+  let addresses;
+  if (net.isIP(target)) {
+    addresses = [{ address: target }];
+  } else {
+    try {
+      addresses = await lookup(target, { all: true, verbatim: true });
+    } catch (cause) {
+      const err = new Error(`Could not resolve allowed target ${target}`);
+      err.status = 400;
+      err.cause = cause;
+      throw err;
+    }
+  }
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    const err = new Error(`Allowed target ${target} resolved to no addresses`);
+    err.status = 400;
+    throw err;
+  }
+  const resolved = [...new Set(addresses.map((entry) => normalizedHost(entry.address)))];
+  const forbidden = resolved.find(isForbiddenAddress);
+  if (forbidden) {
+    const err = new Error(`Target ${target} resolved to forbidden address ${forbidden}`);
+    err.status = 403;
+    throw err;
+  }
+  return resolved;
+}
+
+/**
+ * A connection lookup that returns only addresses already checked by the
+ * outbound-target policy, without asking DNS a second time.
+ * @param {string[]} addresses
+ */
+export function pinnedLookup(addresses) {
+  const entries = addresses.map((address) => ({ address, family: net.isIP(address) || 4 }));
+  return (_hostname, options, callback) => {
+    const cb = typeof options === "function" ? options : callback;
+    const all = typeof options === "object" && options?.all;
+    if (all) cb(null, entries);
+    else cb(null, entries[0].address, entries[0].family);
+  };
+}
+
+/**
+ * Classify a probe target for security-posture hints.
+ * Uses the configured host only — not the process bind address.
+ * Hostnames (except localhost) are "unknown" (no DNS lookup).
+ *
+ * @returns {"local" | "lan" | "public" | "unknown"}
+ */
+export function classifyHostScope(host) {
+  if (typeof host !== "string" || !host.trim()) return "unknown";
+  const h = host.trim().toLowerCase();
+  if (h === "localhost" || h === "::1") return "local";
+  if (!isValidIPv4(h)) return "unknown";
+  const [a, b] = h.split(".").map(Number);
+  if (a === 127) return "local";
+  if (a === 10) return "lan";
+  if (a === 172 && b >= 16 && b <= 31) return "lan";
+  if (a === 192 && b === 168) return "lan";
+  if (a === 100 && b >= 64 && b <= 127) return "lan"; // Tailscale CGNAT (100.64.0.0/10)
+  if (a === 169 && b === 254) return "lan";
+  if (a === 0 || a >= 224) return "unknown";
+  return "public";
+}
+
+/**
+ * Block cloud metadata / link-local misuse. Allow private, loopback, and public
+ * (remote Sparks may be anywhere on a managed network).
+ */
+export function isAllowedTargetHost(host) {
+  if (!isValidHost(host)) return false;
+  return !isForbiddenAddress(host);
+}
+
+/** OpenSSH-safe username. */
+export function isValidSshUser(user) {
+  return typeof user === "string" && /^[a-zA-Z0-9._-]{1,64}$/.test(user);
+}
+
+/**
+ * Reserved Spark ids that must never be accepted from an API client.
+ * Matches the frontend `OVERVIEW_ID` constant (kept in sync manually — it is
+ * a single value and duplicated across the boundary on purpose).
+ */
+export const RESERVED_SPARK_IDS = Object.freeze(new Set(["__overview__"]));
+
+/**
+ * Validate a client-supplied Spark id. Same character class as the SSH user
+ * regex (no path traversal, no shell metacharacters), 1–64 chars, and not a
+ * reserved id. The registry stores the id as a JSON key (no path-injection),
+ * but rejecting early avoids accidental collisions with reserved tab ids.
+ */
+export function isValidSparkId(id) {
+  if (typeof id !== "string") return false;
+  if (!/^[a-zA-Z0-9._-]{1,64}$/.test(id)) return false;
+  if (RESERVED_SPARK_IDS.has(id)) return false;
+  return true;
+}
+
+/**
+ * SSH port. Missing or blank becomes 22. Anything else that is not an
+ * integer from 1 to 65535 returns null so callers can reject it.
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function normalizeSshPort(value) {
+  if (value == null || value === "") return 22;
+  let n;
+  if (typeof value === "number") {
+    n = value;
+  } else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    n = Number(value.trim());
+  } else {
+    return null;
+  }
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
+  return n;
+}
+
+/**
+ * Validate fields used for SSH/LLM probes. Returns null if ok, else error message.
+ * @param {{ lanIp?: string, llmHost?: string, ssh?: { host?: string, user?: string, port?: unknown } }} body
+ */
+export function validateSparkTarget(body) {
+  const user = body?.ssh?.user;
+  if (user != null && user !== "" && !isValidSshUser(user)) {
+    return "Invalid SSH user (allowed: letters, digits, . _ -)";
+  }
+  const llmHost = typeof body?.llmHost === "string" ? body.llmHost.trim() : body?.llmHost;
+  if (llmHost != null && llmHost !== "" && !isAllowedTargetHost(llmHost)) {
+    return `Invalid or disallowed llmHost: ${llmHost}`;
+  }
+  // Validate the optional Mac agent target where it is saved. A value that is
+  // stored but rejected by the collector constructor throws during startup.
+  const agentUrl = typeof body?.agent?.url === "string" ? body.agent.url.trim() : "";
+  if (agentUrl) {
+    try {
+      const parsed = new URL(agentUrl);
+      if (
+        !["http:", "https:"].includes(parsed.protocol) ||
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash ||
+        parsed.pathname !== "/" ||
+        !isAllowedTargetHost(parsed.hostname.replace(/^\[|\]$/g, ""))
+      ) {
+        return "Invalid Mac agent URL: use an HTTP(S) base URL without credentials, query or path and an allowed host";
+      }
+    } catch {
+      return "Invalid Mac agent URL";
+    }
+  }
+  if (body?.agent?.host != null && body.agent.host !== "" && !isAllowedTargetHost(String(body.agent.host))) {
+    return `Invalid or disallowed Mac agent host: ${body.agent.host}`;
+  }
+  if (body?.agent && Object.prototype.hasOwnProperty.call(body.agent, "port")) {
+    const raw = body.agent.port;
+    if (raw != null && raw !== "") {
+      const port = Number.parseInt(String(raw), 10);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        return "Mac agent port must be an integer from 1 to 65535";
+      }
+    }
+  }
+  const lanIp = body?.lanIp || "";
+  const sshHost = body?.ssh?.host || "";
+  const target = sshHost || lanIp;
+  if (!target) {
+    return body?.isLocal ? null : "lanIp or ssh.host is required";
+  }
+  if (!isAllowedTargetHost(target)) {
+    return `Invalid or disallowed host: ${target}`;
+  }
+  if (lanIp && !isAllowedTargetHost(lanIp)) {
+    return `Invalid or disallowed lanIp: ${lanIp}`;
+  }
+  if (body?.ssh && Object.prototype.hasOwnProperty.call(body.ssh, "port")) {
+    const raw = body.ssh.port;
+    if (raw != null && raw !== "" && normalizeSshPort(raw) == null) {
+      return "SSH port must be an integer from 1 to 65535";
+    }
+  }
+  return null;
+}
+
+/**
+ * Bounded per-key sliding-window limiter. Expired keys are removed on access;
+ * new keys fail closed while the configured key ceiling is occupied.
+ */
+export function createRateLimiter(maxRequests, windowMs, options = {}) {
+  /** @type {Map<string, number[]>} */
+  const hits = new Map();
+  const maxKeys = Math.max(1, Number(options.maxKeys) || 1024);
+  const nowFn = typeof options.now === "function" ? options.now : Date.now;
+
+  /**
+   * @param {string} key
+   * @param {boolean} [peek] when true, report whether a consume would succeed without recording a hit
+   */
+  function rateLimit(key, peek = false) {
+    const now = nowFn();
+    for (const [storedKey, times] of hits) {
+      const live = times.filter((t) => now - t < windowMs);
+      if (live.length) hits.set(storedKey, live);
+      else hits.delete(storedKey);
+    }
+    if (!hits.has(key) && hits.size >= maxKeys) return false;
+    const times = hits.get(key) || [];
+    if (times.length >= maxRequests) return false;
+    if (!peek) {
+      times.push(now);
+      hits.set(key, times);
+    }
+    return true;
+  }
+  rateLimit.size = () => hits.size;
+  return rateLimit;
+}
+
+export const DECODE_BENCH_WORK_LIMIT = 262_144;
+
+export function validateDecodeBudget(concurrencies, maxTokens, limit = DECODE_BENCH_WORK_LIMIT) {
+  const work = (Array.isArray(concurrencies) ? concurrencies : []).reduce(
+    (total, value) => total + Number(value || 0) * Number(maxTokens || 0),
+    0
+  );
+  if (!Number.isFinite(work) || work <= 0 || work > limit) {
+    const err = new Error(`Decode benchmark exceeds the ${limit}-token work budget`);
+    err.status = 429;
+    throw err;
+  }
+  return work;
+}
+
+export const DECODE_CONTEXT_WORK_LIMIT = 4_000_000;
+
+/** Deep-context decode prefills every stream of every level, so cap the total prompt tokens. */
+export function validateDecodeContextBudget(concurrencies, contextTokens, limit = DECODE_CONTEXT_WORK_LIMIT) {
+  const work = (Array.isArray(concurrencies) ? concurrencies : []).reduce(
+    (total, value) => total + Number(value || 0) * Number(contextTokens || 0),
+    0
+  );
+  if (!Number.isFinite(work) || work < 0 || work > limit) {
+    const err = new Error(`Deep-context decode exceeds the ${limit}-token prefill budget`);
+    err.status = 429;
+    throw err;
+  }
+  return work;
+}
+
+export function validatePrefillBudget(contextSizes, limit = 600_000) {
+  const work = (Array.isArray(contextSizes) ? contextSizes : []).reduce(
+    (total, value) => total + Number(value || 0),
+    0
+  );
+  if (!Number.isFinite(work) || work <= 0 || work > limit) {
+    const err = new Error(`Prefill benchmark exceeds the ${limit}-token work budget`);
+    err.status = 429;
+    throw err;
+  }
+  return work;
+}

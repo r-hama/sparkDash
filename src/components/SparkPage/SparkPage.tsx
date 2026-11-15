@@ -1,0 +1,379 @@
+import { useTranslation } from "react-i18next";
+import { useState, useEffect, useCallback, type CSSProperties, type ReactNode } from "react";
+import type { SparkSnapshot } from "../../api/types";
+import { isLlmMonitoringEnabled } from "../../api/sparkRole";
+import { updateSpark, refreshSparkMetric, addLlmPort, removeLlmPort } from "../../api/client";
+import { SparkHeader } from "./SparkHeader";
+import { HealthList } from "../ui/HealthFindings";
+import { SparkActions } from "./SparkActions";
+import { GpuPanel } from "./GpuPanel";
+import { CpuPanel } from "./CpuPanel";
+import { RamPanel } from "./RamPanel";
+import { StoragePanel } from "./StoragePanel";
+import { NetworkPanel } from "./NetworkPanel";
+import { TailscalePanel } from "./TailscalePanel";
+import { LlmPanel } from "./LlmPanel";
+import { ComfyPanel } from "./ComfyPanel";
+import { RuntimesPanel } from "../ui/RuntimeChips";
+import { LlmModelsPanel } from "./LlmModelsPanel";
+import { RocePanel } from "./RocePanel";
+import { UnifiedMemoryPanel } from "./UnifiedMemoryPanel";
+import { HistoryPanel } from "./HistoryPanel";
+import "../../styles/spark.css";
+import { memoryModelFor, vramContextFor } from "../../shared/vramBreakdown";
+
+interface SparkPageProps {
+  spark: SparkSnapshot;
+  /** Every unit's snapshot — lets a worker find its head's LLM endpoint. */
+  fleet?: SparkSnapshot[];
+  temperatureUnit: "celsius" | "fahrenheit";
+  /** Show "Copy image" in the benchmark dialogs (Settings, off by default). */
+  benchShareImage?: boolean;
+  /** GPU panel VRAM bar split by engine / system / free (Settings, on by default). */
+  showVramBreakdown?: boolean;
+  /** 48 h / 30 d History panel under the columns (Settings → Metrics history, off by default). */
+  metricsHistory?: boolean;
+  onEdit?: () => void;
+  /** Navigate to a spark id (header back-to-overview link). */
+  onNavigate?: (sparkId: string) => void;
+  onAddHarness?: () => void;
+}
+
+type SparkView = "all" | "resources" | "services";
+
+/** Panel wrapper carrying its single-column (mobile) order as a CSS variable. */
+function Item({ order, children }: { order: number; children: ReactNode }) {
+  return (
+    <div className="sp-item" style={{ ["--o" as string]: order } as CSSProperties}>
+      {children}
+    </div>
+  );
+}
+
+export function SparkPage({
+  spark,
+  fleet,
+  temperatureUnit,
+  benchShareImage = false,
+  showVramBreakdown = true,
+  metricsHistory = false,
+  onEdit,
+  onNavigate,
+  onAddHarness,
+}: SparkPageProps) {
+  const { t } = useTranslation("hardware");
+  const { metrics } = spark;
+  const [disabledDevices, setDisabledDevices] = useState<string[]>(spark.disabledDevices || []);
+  const [disabledInterfaces, setDisabledInterfaces] = useState<string[]>(
+    spark.disabledInterfaces || []
+  );
+  const [llmPorts, setLlmPorts] = useState<number[]>(spark.llmPorts ?? [spark.llmPort ?? 8888]);
+  const [storagePollDisabled, setStoragePollDisabled] = useState<boolean>(
+    spark.storagePollDisabled ?? false
+  );
+  const [showAddPort, setShowAddPort] = useState(false);
+  const [newPortDraft, setNewPortDraft] = useState("");
+
+  // Sync when spark data changes (WS push)
+  useEffect(() => {
+    setDisabledDevices(spark.disabledDevices || []);
+  }, [spark.disabledDevices]);
+
+  useEffect(() => {
+    setDisabledInterfaces(spark.disabledInterfaces || []);
+  }, [spark.disabledInterfaces]);
+
+  useEffect(() => {
+    if (spark.llmPorts) setLlmPorts(spark.llmPorts);
+  }, [spark.llmPorts]);
+
+  useEffect(() => {
+    setStoragePollDisabled(spark.storagePollDisabled ?? false);
+  }, [spark.storagePollDisabled]);
+
+  const handleStoragePollModeChange = useCallback(
+    async (disabled: boolean) => {
+      setStoragePollDisabled(disabled);
+      try {
+        await updateSpark(spark.id, { storagePollDisabled: disabled });
+        // When disabling auto-refresh, do one manual refresh immediately
+        if (disabled) {
+          refreshSparkMetric(spark.id, "storage").catch((err) =>
+            console.error("Failed to refresh storage after disabling auto-refresh:", err)
+          );
+        }
+      } catch (err) {
+        console.error("Failed to update storage poll mode:", err);
+        setStoragePollDisabled(!disabled); // revert
+      }
+    },
+    [spark.id]
+  );
+
+  const handleAddPort = useCallback(
+    async (portOverride?: number) => {
+      const port = portOverride ?? parseInt(newPortDraft, 10);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+      if (llmPorts.includes(port)) {
+        setNewPortDraft("");
+        setShowAddPort(false);
+        return;
+      }
+      try {
+        const result = await addLlmPort(spark.id, port);
+        setLlmPorts(result.llmPorts);
+        setNewPortDraft("");
+        setShowAddPort(false);
+      } catch (err) {
+        console.error("Failed to add LLM port:", err);
+      }
+    },
+    [spark.id, newPortDraft, llmPorts]
+  );
+
+  const handleRemovePort = useCallback(async (port: number) => {
+    try {
+      const result = await removeLlmPort(spark.id, port);
+      setLlmPorts(result.llmPorts);
+    } catch (err) {
+      console.error("Failed to remove LLM port:", err);
+    }
+  }, [spark.id]);
+
+  const llmOn = isLlmMonitoringEnabled(spark);
+  const comfyOn = Boolean(spark.comfyMonitoring);
+  const tailscaleOn = Boolean(spark.tailscaleMonitoring);
+  const showServices = llmOn || comfyOn;
+  // Everything on one page: hardware and services together (no sub-tabs).
+  const view: SparkView = showServices ? "all" : "resources";
+  const showSvc = showServices && view !== "resources";
+  // Agent Macs use verified runtime profiles; other units retain script launchers.
+  const modelsPanel = <LlmModelsPanel spark={spark} />;
+  const profileModels = spark.kind === "mac" && spark.macTransport === "agent";
+  const primaryPort = llmPorts[0];
+  const extraPorts = llmPorts.slice(1);
+  const unified = metrics.unifiedMemory;
+  // A Mac host shares one pool like a Spark (memoryModelFor), so it gets the unified panel too.
+  const showUnified = memoryModelFor(spark.kind, spark.platform) === "unified" && unified != null && unified.total > 0;
+
+  const renderLlmPanel = (port: number, portIndex: number, className?: string) => {
+    // Match by the snapshot's own port so a panel never shows another port's
+    // backend (stale-array window after adding/switching ports); fall back to
+    // position for servers that don't yet report `port`.
+    const llmMetrics =
+      metrics.llm?.find((l) => l?.port != null && l.port === port) ??
+      (metrics.llm?.[portIndex]?.port == null ? (metrics.llm?.[portIndex] ?? null) : null);
+    const canRemove = portIndex > 0;
+    return (
+      <LlmPanel
+        key={port}
+        llm={llmMetrics}
+        sparkId={spark.id}
+        sparkName={spark.name}
+        llmPort={port}
+        llmPorts={llmPorts}
+        hasApiKey={Boolean(spark.llmApiKeyPorts?.includes(port))}
+        shareImage={benchShareImage}
+        onRemovePort={canRemove ? handleRemovePort : undefined}
+        className={className}
+        conversations={spark.conversations?.[String(port)] ?? []}
+        onAddHarness={onAddHarness}
+      />
+    );
+  };
+
+  const addPort = llmOn ? (
+    showAddPort ? (
+      <div className="panel sp-add-port">
+        <input
+          type="number"
+          min={1}
+          max={65535}
+          inputMode="numeric"
+          placeholder={t("page.port")}
+          value={newPortDraft}
+          onChange={(e) => setNewPortDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void handleAddPort();
+            }
+          }}
+          className="sp-input sp-input--port"
+          autoFocus
+        />
+        <button
+          type="button"
+          onClick={() => void handleAddPort()}
+          disabled={!newPortDraft.trim()}
+          className="btn btn--sm btn--primary"
+        >
+          {t("page.add")}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setShowAddPort(false);
+            setNewPortDraft("");
+          }}
+          className="btn btn--sm"
+        >
+          {t("page.cancel")}
+        </button>
+        <div className="sp-add-port__presets" role="group" aria-label={t("page.presets")}>
+          <span className="sp-hint">{t("page.presetLabel")}</span>
+          <button
+            type="button"
+            title={t("page.lmStudio")}
+            onClick={() => void handleAddPort(1234)}
+            className="btn btn--sm"
+          >
+            LM Studio :1234
+          </button>
+          <button
+            type="button"
+            title={t("page.ollama")}
+            onClick={() => void handleAddPort(11434)}
+            className="btn btn--sm"
+          >
+            Ollama :11434
+          </button>
+          <button
+            type="button"
+            title={t("page.tensorFold")}
+            onClick={() => void handleAddPort(8888)}
+            className="btn btn--sm"
+          >
+            TensorFold :8888
+          </button>
+        </div>
+      </div>
+    ) : (
+      <button type="button" onClick={() => setShowAddPort(true)} className="sp-add-port-btn">
+        {t("page.addPort")}
+      </button>
+    )
+  ) : null;
+
+  const comfyPanel = comfyOn ? (
+    <ComfyPanel
+      comfy={metrics.comfy ?? null}
+      comfyPort={spark.comfyPort ?? 8188}
+      sparkId={spark.id}
+      lanIp={spark.lanIp}
+    />
+  ) : null;
+
+  return (
+    <div className="sp">
+      <SparkHeader spark={spark} onEdit={onEdit} onNavigate={onNavigate} />
+      {/* Mobile-only action row (Update Hermes / Edit / Power) — desktop keeps them in the header. */}
+      <SparkActions spark={spark} onEdit={onEdit} className="sp-mobile-actions flex sm:hidden" />
+      {spark.online ? <HealthList findings={spark.health} /> : null}
+
+      {(
+        /* Two independent columns (xl+): hardware on the left, services + I/O on the
+           right. Below xl everything stacks in the Item order (GPU, memory, LLM first). */
+        <div className="sp-cols">
+          <div className="sp-col">
+            <Item order={1}>
+              <GpuPanel
+                gpu={metrics.gpu}
+                vramContext={showVramBreakdown ? vramContextFor(spark, fleet) : null}
+                sparkId={spark.id}
+                temperatureUnit={temperatureUnit}
+                mac={spark.kind === "mac"}
+                unavailable={metrics.unavailable}
+                chip={spark.hardware.gpuChip}
+                hideMemory={showUnified}
+              />
+            </Item>
+            {profileModels && <Item order={5}>{modelsPanel}</Item>}
+            {/* Mac agent transport only: what is actually serving, from the
+                node's own process/port inventory. */}
+            {Array.isArray(metrics.runtimes) && (
+              <Item order={6}>
+                <RuntimesPanel
+                  runtimes={metrics.runtimes}
+                  unavailable={metrics.unavailable}
+                  agentOnline={metrics.agentOnline}
+                />
+              </Item>
+            )}
+            {/* Unified memory (or RAM on a dedicated host) and CPU sit side by side (they stack when the column is narrow). */}
+            <Item order={2}>
+              <div className="sp-pair">
+                {showUnified && <UnifiedMemoryPanel um={unified} gpu={metrics.gpu} llm={metrics.llm} />}
+                <CpuPanel
+                  cpu={metrics.cpu}
+                  hardware={spark.hardware}
+                  sparkId={spark.id}
+                  temperatureUnit={temperatureUnit}
+                  mac={spark.kind === "mac"}
+                  unavailable={metrics.unavailable}
+                />
+                {/* Dedicated hosts have system RAM instead of a unified pool: CPU and RAM side by side.
+                    A Mac's RAM is its unified pool, already shown above (RAM only when the pool is unknown). */}
+                {(spark.kind === "host" || spark.kind === "mac") && !showUnified && <RamPanel ram={metrics.ram} sparkId={spark.id} />}
+                {/* Models is the third column of the row (Windows PCs have no launchers). */}
+                {!profileModels && spark.platform !== "windows" && modelsPanel}
+              </div>
+            </Item>
+            {/* History closes the hardware column: the right column (LLM, storage, network) is
+                usually the taller one, so this fills the space under the GPU / memory / CPU row
+                instead of starting below both columns. Stacked (below xl) it stays last. */}
+            {metricsHistory && (
+              <Item order={40}>
+                <HistoryPanel key={spark.id} sparkId={spark.id} kind={spark.kind} platform={spark.platform} temperatureUnit={temperatureUnit} />
+              </Item>
+            )}
+          </div>
+          <div className="sp-col">
+            {view === "all" && showSvc && llmOn && primaryPort != null && (
+              <Item order={3}>{renderLlmPanel(primaryPort, 0)}</Item>
+            )}
+            {view === "all" && showSvc && comfyPanel && <Item order={4}>{comfyPanel}</Item>}
+            {view === "all" &&
+              showSvc &&
+              llmOn &&
+              extraPorts.map((port, j) => (
+                <Item key={port} order={10 + j}>
+                  {renderLlmPanel(port, j + 1)}
+                </Item>
+              ))}
+            {view === "all" && showSvc && addPort && <Item order={30}>{addPort}</Item>}
+            <Item order={7}>
+              <StoragePanel
+                storage={metrics.storage}
+                sparkId={spark.id}
+                disabledDevices={disabledDevices}
+                onDisabledChange={setDisabledDevices}
+                storagePollDisabled={storagePollDisabled}
+                onStoragePollModeChange={handleStoragePollModeChange}
+              />
+            </Item>
+            <Item order={8}>
+              <NetworkPanel
+                network={metrics.network}
+                sparkId={spark.id}
+                disabledInterfaces={disabledInterfaces}
+                onDisabledChange={setDisabledInterfaces}
+              />
+            </Item>
+            {metrics.roce && metrics.roce.devices.length > 0 && (
+              <Item order={8}>
+                <RocePanel roce={metrics.roce} />
+              </Item>
+            )}
+            {tailscaleOn && (
+              <Item order={9}>
+                <TailscalePanel tailscale={metrics.tailscale ?? null} />
+              </Item>
+            )}
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}

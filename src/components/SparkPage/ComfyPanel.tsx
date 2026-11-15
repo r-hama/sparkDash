@@ -1,0 +1,441 @@
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
+import { useState, useCallback, type MouseEvent } from "react";
+import type { ComfyJob, ComfyMetrics, ComfyProgress } from "../../api/types";
+import { cancelComfyJob } from "../../api/client";
+import { Panel } from "../ui/Panel";
+import { Tag } from "../ui/Tag";
+import { ComfyIcon, ExternalLinkIcon } from "../ui/icons";
+
+interface ComfyPanelProps {
+  comfy: ComfyMetrics | null;
+  comfyPort: number;
+  sparkId: string;
+  /** Spark LAN IP — preferred host for the Open ComfyUI deep link. */
+  lanIp?: string | null;
+  className?: string;
+}
+
+/** Browser URL for ComfyUI UI — always LAN IP when known (never dashboard origin). */
+function comfyOpenUrl(lanIp: string | null | undefined, comfyPort: number, serverOpenUrl?: string | null): string {
+  const port =
+    Number.isInteger(comfyPort) && comfyPort >= 1 && comfyPort <= 65535 ? comfyPort : 8188;
+  const lan = lanIp != null ? String(lanIp).trim() : "";
+  if (lan && lan !== "127.0.0.1" && lan !== "localhost") {
+    return `http://${lan}:${port}`;
+  }
+  // Prefer server-provided URL if it is absolute and not the dashboard path
+  if (serverOpenUrl && /^https?:\/\//i.test(serverOpenUrl)) {
+    try {
+      const u = new URL(serverOpenUrl);
+      if (u.port !== "5555" && !u.pathname.startsWith("/spark")) {
+        return serverOpenUrl;
+      }
+      // If server sent a loopback URL, still use host when non-local path
+      if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") {
+        return `http://${u.hostname}:${port}`;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+  return `http://127.0.0.1:${port}`;
+}
+
+function shortId(id: string): string {
+  if (id.length <= 12) return id;
+  return `${id.slice(0, 8)}…`;
+}
+
+function formatElapsed(createTimeMs: number | null | undefined): string | null {
+  if (createTimeMs == null || !Number.isFinite(createTimeMs)) return null;
+  const ms = createTimeMs < 1e12 ? createTimeMs * 1000 : createTimeMs;
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (elapsedSec < 60) return `${elapsedSec}s`;
+  const m = Math.floor(elapsedSec / 60);
+  const s = elapsedSec % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function formatDurationMs(ms: number | null | undefined): string | null {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function formatEtaMs(ms: number | null | undefined): string | null {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return null;
+  return `~${formatDurationMs(ms)}`;
+}
+
+function jobFootprint(job: ComfyJob, t: TFunction): string {
+  const parts: string[] = [];
+  if (job.width != null && job.height != null) {
+    parts.push(`${job.width}×${job.height}`);
+  }
+  if (job.steps != null) parts.push(t("comfy.steps", { count: job.steps }));
+  if (job.batchSize != null && job.batchSize !== 1) parts.push(t("comfy.batch", { count: job.batchSize }));
+  if (job.sampler) parts.push(job.sampler);
+  if (job.nodeCount > 0) parts.push(t("comfy.nodes", { count: job.nodeCount }));
+  return parts.join(" · ");
+}
+
+function ProgressBar({ progress }: { progress: ComfyProgress }) {
+  const { t } = useTranslation("hardware");
+  const pct =
+    progress.percent != null
+      ? progress.percent
+      : progress.max > 0
+        ? Math.min(100, Math.round((progress.value / progress.max) * 100))
+        : 0;
+  const label =
+    progress.nodeLabel ||
+    (progress.source === "estimate" ? t("comfy.elapsed") : t("comfy.progress"));
+  const detail =
+    progress.max > 0 && progress.source === "ws"
+      ? `${Math.round(progress.value)}/${Math.round(progress.max)}`
+      : progress.percent != null
+        ? `${pct}%`
+        : null;
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-baseline justify-between gap-2 text-[11px]">
+        <span className="truncate text-muted" title={label}>
+          {label}
+          {progress.source === "estimate" ? (
+            <span className="ml-1 text-[10px] opacity-70">{t("comfy.estimate")}</span>
+          ) : null}
+        </span>
+        {detail ? <span className="font-tabular text-text">{detail}</span> : null}
+      </div>
+      <div className="sp-bar">
+        <div
+          className="sp-bar__fill bg-accent"
+          style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function JobBlock({
+  job,
+  variant,
+  progress,
+  etaLabel,
+  onCancel,
+  cancelling,
+}: {
+  job: ComfyJob;
+  variant: "running" | "pending";
+  progress?: ComfyProgress | null;
+  etaLabel?: string | null;
+  onCancel?: () => void;
+  cancelling?: boolean;
+}) {
+  const { t } = useTranslation("hardware");
+  const title = job.title?.trim() || shortId(job.id);
+  const footprint = jobFootprint(job, t);
+  const elapsed = variant === "running" ? formatElapsed(job.createTime) : null;
+  const models = job.models ?? [];
+
+  return (
+    <div className="sp-job">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Tag tone={variant === "running" ? "acc" : "neutral"} title={job.id}>
+              {variant === "running" ? t("comfy.running") : t("comfy.queued")}
+            </Tag>
+            {elapsed ? (
+              <span className="font-tabular text-[11px] text-muted">{elapsed}</span>
+            ) : null}
+            {etaLabel ? (
+              <span className="font-tabular text-[11px] text-muted" title={t("comfy.eta")}>
+                {t("comfy.left", { time: etaLabel })}
+              </span>
+            ) : null}
+          </div>
+          <p className="mt-1 truncate text-sm font-medium text-text" title={job.title || job.id}>
+            {title}
+          </p>
+        </div>
+        {onCancel ? (
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={cancelling}
+            className="btn btn--sm btn--danger shrink-0"
+          >
+            {cancelling ? "…" : variant === "running" ? t("comfy.cancel") : t("comfy.remove")}
+          </button>
+        ) : null}
+      </div>
+
+      {variant === "running" && progress ? <ProgressBar progress={progress} /> : null}
+
+      {footprint ? (
+        <p className="font-tabular text-[11px] text-muted" title={t("comfy.footprint")}>
+          {footprint}
+        </p>
+      ) : null}
+
+      {models.length > 0 ? (
+        <div className="space-y-1">
+          <div className="text-[10px] uppercase tracking-wide text-muted">{t("comfy.models")}</div>
+          <ul className="space-y-0.5">
+            {models.slice(0, 6).map((m) => (
+              <li key={m} className="truncate font-tabular text-[12px] text-text" title={m}>
+                {m}
+              </li>
+            ))}
+            {models.length > 6 ? (
+              <li className="text-[11px] text-muted">{t("comfy.more", { count: models.length - 6 })}</li>
+            ) : null}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function ComfyPanel({
+  comfy,
+  comfyPort,
+  sparkId,
+  lanIp,
+  className = "",
+}: ComfyPanelProps) {
+  const { t } = useTranslation("hardware");
+  const available = Boolean(comfy?.available);
+  const pending = comfy?.queuePending ?? 0;
+  const active = comfy?.activeJob ?? null;
+  const pendingJobs = comfy?.pendingJobs ?? [];
+  const progress = comfy?.progress ?? null;
+  const lastJob = comfy?.lastJob ?? null;
+  const modelsInstalled = comfy?.modelsInstalled ?? null;
+  const modelGroups = modelsInstalled
+    ? [
+        { key: "checkpoints", label: t("comfy.checkpoints"), list: modelsInstalled.checkpoints ?? [] },
+        { key: "loras", label: "LoRAs", list: modelsInstalled.loras ?? [] },
+        { key: "diffusionModels", label: t("comfy.diffusionModels"), list: modelsInstalled.diffusionModels ?? [] },
+        { key: "textEncoders", label: t("comfy.textEncoders"), list: modelsInstalled.textEncoders ?? [] },
+        { key: "vae", label: t("comfy.vae"), list: modelsInstalled.vae ?? [] },
+      ]
+    : [];
+  const etaLabel = formatEtaMs(comfy?.queueEtaMs ?? null);
+  const openUrl = comfyOpenUrl(lanIp, comfyPort, comfy?.openUrl ?? null);
+
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [modelsOpen, setModelsOpen] = useState(false);
+
+  const handleOpenComfy = useCallback(
+    (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Force a real top-level navigation off the sparkDash SPA origin.
+      window.open(openUrl, "_blank", "noopener,noreferrer");
+    },
+    [openUrl]
+  );
+
+  const handleCancel = useCallback(
+    async (promptId: string) => {
+      if (!confirm(t("comfy.cancelConfirm"))) return;
+      setActionError(null);
+      setCancellingId(promptId);
+      try {
+        await cancelComfyJob(sparkId, promptId);
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setCancellingId(null);
+      }
+    },
+    [sparkId, t]
+  );
+
+  return (
+    <Panel
+      title="ComfyUI"
+      icon={<ComfyIcon />}
+      className={`panel-comfy ${className}`}
+      bodyClassName="sp-stack"
+      actions={
+        <div className="flex items-center gap-2">
+          <span className="font-tabular text-[11px] text-muted" title={t("comfy.port")}>
+            :{comfyPort}
+          </span>
+          <a
+            href={openUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={handleOpenComfy}
+            title={t("comfy.openHint", { url: openUrl })}
+            className="btn btn--sm"
+          >
+            <ExternalLinkIcon className="h-3 w-3" />
+            {t("comfy.open")}
+          </a>
+        </div>
+      }
+    >
+      {!available ? (
+        <div className="space-y-1 text-sm">
+          <p className="text-muted">{t("comfy.unreachable")}</p>
+          {comfy?.error ? (
+            <p className="break-all text-[11px] text-muted">{comfy.error}</p>
+          ) : (
+            <p className="text-[11px] text-muted">
+              {t("comfy.ensure")}
+            </p>
+          )}
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <Tag tone="good">{t("comfy.online")}</Tag>
+            {comfy?.version ? (
+              <span className="text-muted" title={t("comfy.version")}>
+                v{comfy.version}
+              </span>
+            ) : null}
+            {comfy?.deviceType ? (
+              <span className="text-muted" title={t("comfy.device")}>
+                {comfy.deviceType}
+              </span>
+            ) : null}
+            {comfy?.pytorchVersion ? (
+              <span className="text-muted" title={t("comfy.pytorch")}>
+                torch {comfy.pytorchVersion}
+              </span>
+            ) : null}
+          </div>
+
+          {actionError ? (
+            <p className="text-[11px] text-danger">{actionError}</p>
+          ) : null}
+
+          {active ? (
+            <JobBlock
+              job={active}
+              variant="running"
+              progress={progress}
+              etaLabel={etaLabel}
+              onCancel={() => void handleCancel(active.id)}
+              cancelling={cancellingId === active.id}
+            />
+          ) : (
+            <div className="space-y-2">
+              <div className="sp-idle">
+                {t("comfy.idle")}
+              </div>
+              {lastJob ? (
+                <p
+                  className={`text-[11px] ${
+                    lastJob.status === "failed"
+                      ? "text-danger"
+                      : lastJob.status === "cancelled"
+                        ? "text-muted"
+                        : "text-muted"
+                  }`}
+                >
+                  {t("comfy.last")}{" "}
+                  <span className="text-text">
+                    {lastJob.title?.trim() || shortId(lastJob.id)}
+                  </span>
+                  {formatDurationMs(lastJob.durationMs)
+                    ? ` · ${formatDurationMs(lastJob.durationMs)}`
+                    : ""}
+                  {` · ${lastJob.status === "failed" ? t("comfy.failed") : lastJob.status === "cancelled" ? t("comfy.cancelled") : lastJob.status === "completed" ? t("comfy.completed") : lastJob.status}`}
+                </p>
+              ) : null}
+            </div>
+          )}
+
+          {pending > 0 ? (
+            <div className="space-y-2">
+              <div className="flex items-baseline justify-between gap-2 text-[10px] uppercase tracking-wide text-muted">
+                <span>{t("comfy.queue")}</span>
+                <span className="font-tabular normal-case text-muted">
+                  {t("comfy.pending", { count: pending })}
+                  {etaLabel ? ` · ${etaLabel}` : ""}
+                </span>
+              </div>
+              {pendingJobs.slice(0, 2).map((job) => (
+                <JobBlock
+                  key={job.id}
+                  job={job}
+                  variant="pending"
+                  onCancel={() => void handleCancel(job.id)}
+                  cancelling={cancellingId === job.id}
+                />
+              ))}
+              {pending > Math.min(2, pendingJobs.length) ? (
+                <p className="text-[11px] text-muted">
+                  {t("comfy.moreWaiting", { count: pending - Math.min(2, pendingJobs.length) })}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {active && lastJob ? (
+            <p className="text-[11px] text-muted">
+              {t("comfy.last")} {lastJob.title?.trim() || shortId(lastJob.id)}
+              {formatDurationMs(lastJob.durationMs)
+                ? ` · ${formatDurationMs(lastJob.durationMs)}`
+                : ""}
+              {` · ${lastJob.status === "failed" ? t("comfy.failed") : lastJob.status === "cancelled" ? t("comfy.cancelled") : lastJob.status === "completed" ? t("comfy.completed") : lastJob.status}`}
+            </p>
+          ) : null}
+
+          {modelsInstalled && modelGroups.some((g) => g.list.length > 0) ? (
+            <div className="sp-section">
+              <button
+                type="button"
+                onClick={() => setModelsOpen((o) => !o)}
+                className="flex w-full items-center justify-between text-left text-[11px] text-muted hover:text-text"
+              >
+                <span>
+                  {t("comfy.installedTotal", { total: modelGroups.reduce((n, g) => n + g.list.length, 0) })}
+                </span>
+                <span className="text-[10px]">{modelsOpen ? t("comfy.hide") : t("comfy.show")}</span>
+              </button>
+              {modelsOpen ? (
+                <div className="mt-1.5 grid gap-2 sm:grid-cols-2">
+                  {modelGroups
+                    .filter((g) => g.list.length > 0)
+                    .map((g) => (
+                      <div key={g.key}>
+                        <div className="text-[10px] uppercase tracking-wide text-muted">{g.label}</div>
+                        <ul className="mt-0.5 space-y-0.5">
+                          {g.list.slice(0, 12).map((m) => (
+                            <li
+                              key={g.key + m}
+                              className="truncate font-tabular text-[11px] text-text"
+                              title={m}
+                            >
+                              {m}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
+    </Panel>
+  );
+}
